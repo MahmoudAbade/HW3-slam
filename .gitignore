@@ -1,0 +1,5 @@
+venv/
+rgbd_dataset_freiburg2_pioneer_slam3/
+Dataset_VO
+*.tgz
+__pycache__/
