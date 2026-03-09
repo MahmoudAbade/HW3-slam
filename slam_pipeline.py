@@ -1,7 +1,10 @@
 import cv2
 import numpy as np
 import os
-import pypangolin as pangolin
+try:
+    import pypangolin as pangolin
+except ImportError:
+    pangolin = None
 import OpenGL.GL as gl
 import math
 from scipy.spatial.transform import Rotation
@@ -537,6 +540,8 @@ class SLAMPipeline:
                     if self.last_timestamp is not None and self.imu.interp_ax is not None:
                         imu_delta = self.imu.get_delta_position(self.last_timestamp, curr_ts)
 
+                    old_pose = self.current_pose.copy()
+                    dt = curr_ts - self.last_timestamp if self.last_timestamp is not None else 0
                     vo_succeeded = False
                     if self.last_kps is not None and descs is not None:
                         matches = self.tracker.robust_matching(self.last_descs, descs)
@@ -560,20 +565,27 @@ class SLAMPipeline:
                             if delta_t < 0.15 and angle_delta < math.radians(15):
                                 self.current_pose = candidate_pose
                                 vo_succeeded = True
-                                # Reset IMU velocity drift when VO is good
-                                self.imu.reset_velocity()
+
+                                # Update IMU velocity with VO velocity in local frame
+                                if dt > 0:
+                                    delta_pos_world = self.current_pose[:3, 3] - old_pose[:3, 3]
+                                    delta_pos_local = old_pose[:3, :3].T @ delta_pos_world
+                                    self.imu.velocity = delta_pos_local / dt
+                                else:
+                                    self.imu.velocity = np.zeros(3)
 
                         # --- IMU fusion: blend IMU delta with VO position ---
                         if vo_succeeded and np.linalg.norm(imu_delta) > 1e-6:
-                            # Rotate IMU delta to world frame using current orientation
-                            imu_delta_world = self.current_pose[:3, :3] @ imu_delta
-                            # Complementary filter: small IMU correction on top of VO
-                            self.current_pose[:3, 3] += self.imu_weight * imu_delta_world
+                            # Rotate IMU delta to world frame using old orientation
+                            imu_delta_world = old_pose[:3, :3] @ imu_delta
+                            p_vo = self.current_pose[:3, 3]
+                            p_imu = old_pose[:3, 3] + imu_delta_world
+                            self.current_pose[:3, 3] = (1 - self.imu_weight) * p_vo + self.imu_weight * p_imu
 
                         # If VO failed, use IMU-only prediction
                         if not vo_succeeded and np.linalg.norm(imu_delta) > 1e-6:
-                            imu_delta_world = self.current_pose[:3, :3] @ imu_delta
-                            self.current_pose[:3, 3] += imu_delta_world
+                            imu_delta_world = old_pose[:3, :3] @ imu_delta
+                            self.current_pose[:3, 3] = old_pose[:3, 3] + imu_delta_world
 
                         # --- PnP Re-localization every N frames ---
                         if frame_idx > 0 and frame_idx % self.RELOC_INTERVAL == 0 and len(self.keyframes) > 2:
