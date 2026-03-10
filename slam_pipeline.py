@@ -591,14 +591,21 @@ class SLAMPipeline:
                         if frame_idx > 0 and frame_idx % self.RELOC_INTERVAL == 0 and len(self.keyframes) > 2:
                             reloc_pose = self._relocalize_against_keyframes(kps, descs)
                             if reloc_pose is not None:
-                                alpha = 0.7
-                                self.current_pose[:3, 3] = (
-                                    alpha * reloc_pose[:3, 3] +
-                                    (1 - alpha) * self.current_pose[:3, 3]
-                                )
-                                self.current_pose[:3, :3] = reloc_pose[:3, :3]
-                                self.imu.reset_velocity()
-                                reloc_count += 1
+                                # Validate rotation difference before applying
+                                R_diff = self.current_pose[:3, :3].T @ reloc_pose[:3, :3]
+                                trace_diff = max(-1.0, min(3.0, np.trace(R_diff)))
+                                angle_diff = abs(math.acos(max(-1.0, min(1.0, (trace_diff - 1) / 2.0))))
+
+                                if angle_diff < math.radians(5): # Strict 5 degree limit
+                                    alpha = 0.7
+                                    self.current_pose[:3, 3] = (
+                                        alpha * reloc_pose[:3, 3] +
+                                        (1 - alpha) * self.current_pose[:3, 3]
+                                    )
+                                    # Blend rotation slightly instead of hard overwrite or just keep current
+                                    # self.current_pose[:3, :3] = reloc_pose[:3, :3]
+                                    self.imu.reset_velocity()
+                                    reloc_count += 1
 
                         # Store keyframe every 15 frames
                         if descs is not None and (frame_idx % 15 == 0 or len(self.keyframes) == 0):
@@ -610,12 +617,26 @@ class SLAMPipeline:
                     if self.T_align is None and frame['gt_pose'] is not None:
                         self.T_align = frame['gt_pose'] @ np.linalg.inv(self.current_pose)
                         self.initial_height = frame['gt_pose'][2, 3]
+                        r = Rotation.from_matrix(frame['gt_pose'][:3, :3])
+                        self.initial_euler = r.as_euler('xyz', degrees=False)
 
-                    # Aligned pose for display
-                    if self.T_align is not None:
+                    # Enforce Planar Constraints (Ground Vehicle)
+                    if self.T_align is not None and hasattr(self, 'initial_euler') and self.initial_height is not None:
                         aligned_pose = self.T_align @ self.current_pose
-                        if self.initial_height is not None:
-                            aligned_pose[2, 3] = self.initial_height
+
+                        # 1. Constrain Height (Z)
+                        aligned_pose[2, 3] = self.initial_height
+
+                        # 2. Constrain Roll and Pitch (X and Y rotations)
+                        r = Rotation.from_matrix(aligned_pose[:3, :3])
+                        euler = r.as_euler('xyz', degrees=False)
+                        euler[0] = self.initial_euler[0]
+                        euler[1] = self.initial_euler[1]
+
+                        aligned_pose[:3, :3] = Rotation.from_euler('xyz', euler).as_matrix()
+
+                        # Back-project constraint to the camera frame
+                        self.current_pose = np.linalg.inv(self.T_align) @ aligned_pose
                     else:
                         aligned_pose = self.current_pose
 
