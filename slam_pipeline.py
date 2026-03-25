@@ -1,7 +1,10 @@
 import cv2
 import numpy as np
 import os
-import pypangolin as pangolin
+try:
+    import pypangolin as pangolin
+except ImportError:
+    pangolin = None
 import OpenGL.GL as gl
 import math
 from scipy.spatial.transform import Rotation
@@ -422,9 +425,10 @@ class SLAMPipeline:
 
         # Keyframe database: list of (kps, descs, depth, pose_at_keyframe)
         self.keyframes = []
-        self.last_kps = None
-        self.last_descs = None
-        self.last_depth = None
+        self.ref_kps = None
+        self.ref_descs = None
+        self.ref_depth = None
+        self.ref_pose = None
         self.last_timestamp = None
 
         # Alignment
@@ -537,60 +541,81 @@ class SLAMPipeline:
                     if self.last_timestamp is not None and self.imu.interp_ax is not None:
                         imu_delta = self.imu.get_delta_position(self.last_timestamp, curr_ts)
 
+                    old_pose = self.current_pose.copy()
+                    dt = curr_ts - self.last_timestamp if self.last_timestamp is not None else 0
                     vo_succeeded = False
-                    if self.last_kps is not None and descs is not None:
-                        matches = self.tracker.robust_matching(self.last_descs, descs)
+
+                    if self.ref_kps is not None and descs is not None:
+                        # Match against the Reference Keyframe
+                        matches = self.tracker.robust_matching(self.ref_descs, descs)
 
                         R, tvec, inliers = self.estimator.estimate_motion_pnp(
-                            self.last_kps, kps, matches, self.last_depth
+                            self.ref_kps, kps, matches, self.ref_depth
                         )
 
                         if R is not None:
                             delta_T = np.eye(4)
                             delta_T[:3, :3] = R
                             delta_T[:3, 3] = tvec.flatten()
-                            candidate_pose = self.current_pose @ np.linalg.inv(delta_T)
 
-                            # Motion validation
-                            delta_t = np.linalg.norm(candidate_pose[:3, 3] - self.current_pose[:3, 3])
-                            R_delta = self.current_pose[:3, :3].T @ candidate_pose[:3, :3]
+                            # Candidate pose is relative to the Reference Keyframe
+                            candidate_pose = self.ref_pose @ np.linalg.inv(delta_T)
+
+                            # Motion validation against previous frame (not keyframe!)
+                            delta_t = np.linalg.norm(candidate_pose[:3, 3] - old_pose[:3, 3])
+                            R_delta = old_pose[:3, :3].T @ candidate_pose[:3, :3]
                             trace_val = max(-1.0, min(3.0, np.trace(R_delta)))
                             angle_delta = abs(math.acos(max(-1.0, min(1.0, (trace_val - 1) / 2.0))))
 
-                            if delta_t < 0.15 and angle_delta < math.radians(15):
+                            # Relax thresholds slightly since it's compared against last frame but generated from ref
+                            if delta_t < 0.25 and angle_delta < math.radians(20):
                                 self.current_pose = candidate_pose
                                 vo_succeeded = True
-                                # Reset IMU velocity drift when VO is good
-                                self.imu.reset_velocity()
+
+                                # Update IMU velocity with VO velocity in local frame
+                                if dt > 0:
+                                    delta_pos_world = self.current_pose[:3, 3] - old_pose[:3, 3]
+                                    delta_pos_local = old_pose[:3, :3].T @ delta_pos_world
+                                    self.imu.velocity = delta_pos_local / dt
+                                else:
+                                    self.imu.velocity = np.zeros(3)
+
+                            # Update Reference Keyframe if we move too far from it or matches drop
+                            dist_from_ref = np.linalg.norm(self.current_pose[:3, 3] - self.ref_pose[:3, 3])
+                            if inliers < 30 or dist_from_ref > 0.15 or angle_delta > math.radians(10):
+                                self.ref_kps = kps
+                                self.ref_descs = descs
+                                self.ref_depth = depth
+                                self.ref_pose = self.current_pose.copy()
+                                self._add_keyframe(kps, descs, depth)
 
                         # --- IMU fusion: blend IMU delta with VO position ---
                         if vo_succeeded and np.linalg.norm(imu_delta) > 1e-6:
-                            # Rotate IMU delta to world frame using current orientation
-                            imu_delta_world = self.current_pose[:3, :3] @ imu_delta
-                            # Complementary filter: small IMU correction on top of VO
-                            self.current_pose[:3, 3] += self.imu_weight * imu_delta_world
+                            # Rotate IMU delta to world frame using old orientation
+                            imu_delta_world = old_pose[:3, :3] @ imu_delta
+                            p_vo = self.current_pose[:3, 3]
+                            p_imu = old_pose[:3, 3] + imu_delta_world
+                            self.current_pose[:3, 3] = (1 - self.imu_weight) * p_vo + self.imu_weight * p_imu
 
                         # If VO failed, use IMU-only prediction
                         if not vo_succeeded and np.linalg.norm(imu_delta) > 1e-6:
-                            imu_delta_world = self.current_pose[:3, :3] @ imu_delta
-                            self.current_pose[:3, 3] += imu_delta_world
+                            imu_delta_world = old_pose[:3, :3] @ imu_delta
+                            self.current_pose[:3, 3] = old_pose[:3, 3] + imu_delta_world
 
-                        # --- PnP Re-localization every N frames ---
-                        if frame_idx > 0 and frame_idx % self.RELOC_INTERVAL == 0 and len(self.keyframes) > 2:
-                            reloc_pose = self._relocalize_against_keyframes(kps, descs)
-                            if reloc_pose is not None:
-                                alpha = 0.7
-                                self.current_pose[:3, 3] = (
-                                    alpha * reloc_pose[:3, 3] +
-                                    (1 - alpha) * self.current_pose[:3, 3]
-                                )
-                                self.current_pose[:3, :3] = reloc_pose[:3, :3]
-                                self.imu.reset_velocity()
-                                reloc_count += 1
+                        # If VO failed entirely, update ref frame so we don't get stuck
+                        if not vo_succeeded:
+                            self.ref_kps = kps
+                            self.ref_descs = descs
+                            self.ref_depth = depth
+                            self.ref_pose = self.current_pose.copy()
 
-                        # Store keyframe every 15 frames
-                        if descs is not None and (frame_idx % 15 == 0 or len(self.keyframes) == 0):
-                            self._add_keyframe(kps, descs, depth)
+                    elif descs is not None:
+                        # Initialize reference frame on first successful feature extraction
+                        self.ref_kps = kps
+                        self.ref_descs = descs
+                        self.ref_depth = depth
+                        self.ref_pose = self.current_pose.copy()
+                        self._add_keyframe(kps, descs, depth)
 
                     self.last_timestamp = curr_ts
 
@@ -598,12 +623,26 @@ class SLAMPipeline:
                     if self.T_align is None and frame['gt_pose'] is not None:
                         self.T_align = frame['gt_pose'] @ np.linalg.inv(self.current_pose)
                         self.initial_height = frame['gt_pose'][2, 3]
+                        r = Rotation.from_matrix(frame['gt_pose'][:3, :3])
+                        self.initial_euler = r.as_euler('xyz', degrees=False)
 
-                    # Aligned pose for display
-                    if self.T_align is not None:
+                    # Enforce Planar Constraints (Ground Vehicle)
+                    if self.T_align is not None and hasattr(self, 'initial_euler') and self.initial_height is not None:
                         aligned_pose = self.T_align @ self.current_pose
-                        if self.initial_height is not None:
-                            aligned_pose[2, 3] = self.initial_height
+
+                        # 1. Constrain Height (Z)
+                        aligned_pose[2, 3] = self.initial_height
+
+                        # 2. Constrain Roll and Pitch (X and Y rotations)
+                        r = Rotation.from_matrix(aligned_pose[:3, :3])
+                        euler = r.as_euler('xyz', degrees=False)
+                        euler[0] = self.initial_euler[0]
+                        euler[1] = self.initial_euler[1]
+
+                        aligned_pose[:3, :3] = Rotation.from_euler('xyz', euler).as_matrix()
+
+                        # Back-project constraint to the camera frame
+                        self.current_pose = np.linalg.inv(self.T_align) @ aligned_pose
                     else:
                         aligned_pose = self.current_pose
 
@@ -615,9 +654,7 @@ class SLAMPipeline:
                         self.camera_frustums.append(map_pose.copy())
                         self.mapper.integrate_frame(rgb, depth, map_pose)
 
-                    self.last_kps = kps
-                    self.last_descs = descs
-                    self.last_depth = depth
+
 
                 frame_idx += 1
                 if frame_idx % 50 == 0:
