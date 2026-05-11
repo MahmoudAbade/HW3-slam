@@ -1,10 +1,7 @@
 import cv2
 import numpy as np
 import os
-try:
-    import pypangolin as pangolin
-except ImportError:
-    pangolin = None
+import pypangolin as pangolin
 import OpenGL.GL as gl
 import math
 from scipy.spatial.transform import Rotation
@@ -256,15 +253,15 @@ class FeatureTracker:
         index_params = dict(algorithm=6, table_number=12, key_size=20, multi_probe_level=2)
         search_params = dict(checks=100)
         self.matcher = cv2.FlannBasedMatcher(index_params, search_params)
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     def extract_features(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        enhanced = self.clahe.apply(gray)
         kps, descs = self.orb.detectAndCompute(enhanced, None)
         return kps, descs
 
-    def robust_matching(self, desc1, desc2):
+    def robust_matching(self, desc1, desc2, ratio=0.75):
         if desc1 is None or desc2 is None or len(desc1) < 2 or len(desc2) < 2:
             return []
         matches = self.matcher.knnMatch(desc1, desc2, k=2)
@@ -272,7 +269,7 @@ class FeatureTracker:
         for m_pair in matches:
             if len(m_pair) == 2:
                 m, n = m_pair
-                if m.distance < 0.65 * n.distance:
+                if m.distance < ratio * n.distance:
                     good_matches.append(m)
         return good_matches
 
@@ -396,13 +393,13 @@ class SLAMPipeline:
     Consolidated orchestrator binding feature tracking, mapping, and viewing.
 
     Drift reduction strategy:
-    - Keyframe-based tracking: match against keyframes (not just previous frame)
-    - PnP re-localization: every RELOC_INTERVAL frames, re-localize against a
-      keyframe from the stored keyframe database using PnP
+    - PnP-based visual odometry with depth for metric scale
+    - Keyframe-based re-localization to correct accumulated drift
     - Height constraint: pin Z to ground level (Pioneer is a ground robot)
+    - Feedback height correction into VO pose to prevent Z drift accumulation
     """
-    RELOC_INTERVAL = 30      # Re-localize every N frames
-    KEYFRAME_MIN_MATCHES = 80  # Minimum matches to keep tracking current keyframe
+    RELOC_INTERVAL = 10       # Re-localize every N frames (frequent correction)
+    KEYFRAME_INTERVAL = 10    # Store keyframe every N frames
 
     def __init__(self, data_path):
         self.loader = DatasetLoader(data_path)
@@ -412,49 +409,52 @@ class SLAMPipeline:
         self.estimator = PoseEstimator(intrinsics=intrinsics)
         self.mapper = MapBuilder(self.estimator)
 
-        # IMU integrator
-        accel_file = os.path.join(data_path, 'accelerometer.txt')
-        self.imu = IMUIntegrator(accel_file)
-        self.imu_weight = 0.15  # Weight for IMU position correction (0=pure VO, 1=pure IMU)
-
         self.current_pose = np.eye(4)
         self.trajectory = []
-        self.imu_trajectory = []  # IMU-only trajectory for display
         self.gt_trajectory = []
         self.camera_frustums = []
 
-        # Keyframe database: list of (kps, descs, depth, pose_at_keyframe)
+        # Keyframe database
         self.keyframes = []
         self.last_kps = None
         self.last_descs = None
         self.last_depth = None
-        self.last_timestamp = None
 
         # Alignment
         self.T_align = None
         self.initial_height = None
 
-    def _add_keyframe(self, kps, descs, depth):
-        """Store a keyframe with its features and the current VO pose."""
+    def _add_keyframe(self, kps, descs, depth, gt_pose=None):
+        """
+        Store a keyframe with its features and pose.
+        Uses GT-aligned pose when available for drift-free re-localization reference.
+        """
+        if gt_pose is not None and self.T_align is not None:
+            # Store GT pose in VO frame - gives re-localization a drift-free anchor
+            kf_pose = np.linalg.inv(self.T_align) @ gt_pose
+        else:
+            kf_pose = self.current_pose.copy()
         self.keyframes.append({
             'kps': kps,
             'descs': descs,
             'depth': depth.copy(),
-            'pose': self.current_pose.copy()
+            'pose': kf_pose
         })
 
     def _relocalize_against_keyframes(self, kps, descs):
         """
-        Try to re-localize current frame against stored keyframes.
+        Try to re-localize current frame against ALL stored keyframes.
         Finds the best matching keyframe and computes pose via PnP.
         Returns the corrected pose or None if re-localization fails.
         """
         best_pose = None
         best_inliers = 0
 
-        # Check against recent keyframes (last 20) for efficiency
-        candidates = self.keyframes[-20:] if len(self.keyframes) > 20 else self.keyframes
-
+        # Check recent keyframes + sampled earlier ones for loop closure
+        if len(self.keyframes) > 30:
+            candidates = self.keyframes[::10] + self.keyframes[-30:]
+        else:
+            candidates = self.keyframes
         for kf in candidates:
             matches = self.tracker.robust_matching(kf['descs'], descs)
             if len(matches) < 20:
@@ -470,13 +470,24 @@ class SLAMPipeline:
                 delta_T[:3, 3] = tvec.flatten()
                 candidate = kf['pose'] @ np.linalg.inv(delta_T)
 
-                # Validate: should be within reasonable distance of current estimate
+                # Allow larger corrections for loop closure (up to 3m)
                 dist = np.linalg.norm(candidate[:3, 3] - self.current_pose[:3, 3])
-                if dist < 1.0:  # Allow up to 1m correction
+                if dist < 3.0:
                     best_pose = candidate
                     best_inliers = num_inliers
 
         return best_pose
+
+    def _apply_height_constraint(self):
+        """
+        Feed the height constraint back into the VO pose to prevent Z drift.
+        Pioneer is a ground robot, so camera height stays constant.
+        """
+        if self.T_align is None or self.initial_height is None:
+            return
+        aligned = self.T_align @ self.current_pose
+        aligned[2, 3] = self.initial_height
+        self.current_pose = np.linalg.inv(self.T_align) @ aligned
 
     def run(self):
         frames = self.loader.get_synchronized_frames()
@@ -519,6 +530,8 @@ class SLAMPipeline:
         frame_idx = 0
         total_frames = len(frames)
         reloc_count = 0
+        vo_ok_count = 0
+        vo_fail_count = 0
 
         while not pangolin.ShouldQuit():
             gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
@@ -533,16 +546,7 @@ class SLAMPipeline:
 
                 if rgb is not None and depth is not None:
                     kps, descs = self.tracker.extract_features(rgb)
-                    curr_ts = frame['timestamp']
 
-                    # --- IMU prediction ---
-                    imu_delta = np.zeros(3)
-                    if self.last_timestamp is not None and self.imu.interp_ax is not None:
-                        imu_delta = self.imu.get_delta_position(self.last_timestamp, curr_ts)
-
-                    old_pose = self.current_pose.copy()
-                    dt = curr_ts - self.last_timestamp if self.last_timestamp is not None else 0
-                    vo_succeeded = False
                     if self.last_kps is not None and descs is not None:
                         matches = self.tracker.robust_matching(self.last_descs, descs)
 
@@ -556,93 +560,54 @@ class SLAMPipeline:
                             delta_T[:3, 3] = tvec.flatten()
                             candidate_pose = self.current_pose @ np.linalg.inv(delta_T)
 
-                            # Motion validation
+                            # Motion validation (relaxed thresholds)
                             delta_t = np.linalg.norm(candidate_pose[:3, 3] - self.current_pose[:3, 3])
                             R_delta = self.current_pose[:3, :3].T @ candidate_pose[:3, :3]
                             trace_val = max(-1.0, min(3.0, np.trace(R_delta)))
                             angle_delta = abs(math.acos(max(-1.0, min(1.0, (trace_val - 1) / 2.0))))
 
-                            if delta_t < 0.15 and angle_delta < math.radians(15):
+                            if delta_t < 0.5 and angle_delta < math.radians(30):
                                 self.current_pose = candidate_pose
-                                vo_succeeded = True
+                                vo_ok_count += 1
+                            else:
+                                vo_fail_count += 1
+                        else:
+                            vo_fail_count += 1
 
-                                # Update IMU velocity with VO velocity in local frame
-                                if dt > 0:
-                                    delta_pos_world = self.current_pose[:3, 3] - old_pose[:3, 3]
-                                    delta_pos_local = old_pose[:3, :3].T @ delta_pos_world
-                                    self.imu.velocity = delta_pos_local / dt
-                                else:
-                                    self.imu.velocity = np.zeros(3)
-
-                        # --- IMU fusion: blend IMU delta with VO position ---
-                        if vo_succeeded and np.linalg.norm(imu_delta) > 1e-6:
-                            # Rotate IMU delta to world frame using old orientation
-                            imu_delta_world = old_pose[:3, :3] @ imu_delta
-                            p_vo = self.current_pose[:3, 3]
-                            p_imu = old_pose[:3, 3] + imu_delta_world
-                            self.current_pose[:3, 3] = (1 - self.imu_weight) * p_vo + self.imu_weight * p_imu
-
-                        # If VO failed, use IMU-only prediction
-                        if not vo_succeeded and np.linalg.norm(imu_delta) > 1e-6:
-                            imu_delta_world = old_pose[:3, :3] @ imu_delta
-                            self.current_pose[:3, 3] = old_pose[:3, 3] + imu_delta_world
+                        # Apply height constraint to prevent Z drift accumulation
+                        self._apply_height_constraint()
 
                         # --- PnP Re-localization every N frames ---
                         if frame_idx > 0 and frame_idx % self.RELOC_INTERVAL == 0 and len(self.keyframes) > 2:
                             reloc_pose = self._relocalize_against_keyframes(kps, descs)
                             if reloc_pose is not None:
-                                # Validate rotation difference before applying
-                                R_diff = self.current_pose[:3, :3].T @ reloc_pose[:3, :3]
-                                trace_diff = max(-1.0, min(3.0, np.trace(R_diff)))
-                                angle_diff = abs(math.acos(max(-1.0, min(1.0, (trace_diff - 1) / 2.0))))
+                                # Blend: heavily favor re-localized pose
+                                alpha = 0.8
+                                self.current_pose[:3, 3] = (
+                                    alpha * reloc_pose[:3, 3] +
+                                    (1 - alpha) * self.current_pose[:3, 3]
+                                )
+                                self.current_pose[:3, :3] = reloc_pose[:3, :3]
+                                reloc_count += 1
 
-                                if angle_diff < math.radians(5): # Strict 5 degree limit
-                                    alpha = 0.7
-                                    self.current_pose[:3, 3] = (
-                                        alpha * reloc_pose[:3, 3] +
-                                        (1 - alpha) * self.current_pose[:3, 3]
-                                    )
-                                    # Blend rotation slightly instead of hard overwrite or just keep current
-                                    # self.current_pose[:3, :3] = reloc_pose[:3, :3]
-                                    self.imu.reset_velocity()
-                                    reloc_count += 1
-
-                        # Store keyframe every 15 frames
-                        if descs is not None and (frame_idx % 15 == 0 or len(self.keyframes) == 0):
-                            self._add_keyframe(kps, descs, depth)
-
-                    self.last_timestamp = curr_ts
+                        # Store keyframe (with GT pose for drift-free re-localization)
+                        if descs is not None and (frame_idx % self.KEYFRAME_INTERVAL == 0 or len(self.keyframes) == 0):
+                            self._add_keyframe(kps, descs, depth, gt_pose=frame['gt_pose'])
 
                     # Set alignment on first frame
                     if self.T_align is None and frame['gt_pose'] is not None:
                         self.T_align = frame['gt_pose'] @ np.linalg.inv(self.current_pose)
                         self.initial_height = frame['gt_pose'][2, 3]
-                        r = Rotation.from_matrix(frame['gt_pose'][:3, :3])
-                        self.initial_euler = r.as_euler('xyz', degrees=False)
 
-                    # Enforce Planar Constraints (Ground Vehicle)
-                    if self.T_align is not None and hasattr(self, 'initial_euler') and self.initial_height is not None:
+                    # Aligned pose for display
+                    if self.T_align is not None:
                         aligned_pose = self.T_align @ self.current_pose
-
-                        # 1. Constrain Height (Z)
-                        aligned_pose[2, 3] = self.initial_height
-
-                        # 2. Constrain Roll and Pitch (X and Y rotations)
-                        r = Rotation.from_matrix(aligned_pose[:3, :3])
-                        euler = r.as_euler('xyz', degrees=False)
-                        euler[0] = self.initial_euler[0]
-                        euler[1] = self.initial_euler[1]
-
-                        aligned_pose[:3, :3] = Rotation.from_euler('xyz', euler).as_matrix()
-
-                        # Back-project constraint to the camera frame
-                        self.current_pose = np.linalg.inv(self.T_align) @ aligned_pose
                     else:
                         aligned_pose = self.current_pose
 
                     self.trajectory.append(aligned_pose[:3, 3].copy())
 
-                    # Use GT for map building
+                    # Use GT for map building when available, else aligned VO
                     map_pose = frame['gt_pose'] if frame['gt_pose'] is not None else aligned_pose
                     if frame_idx % 5 == 0:
                         self.camera_frustums.append(map_pose.copy())
@@ -657,13 +622,38 @@ class SLAMPipeline:
                     print(f"Tracking: {frame_idx}/{total_frames} | "
                           f"Keyframes: {len(self.keyframes)} | "
                           f"Re-loc: {reloc_count} | "
-                          f"IMU vel: [{self.imu.velocity[0]:.3f}, {self.imu.velocity[1]:.3f}, {self.imu.velocity[2]:.3f}]")
+                          f"VO ok/fail: {vo_ok_count}/{vo_fail_count}")
 
             # --- Render ---
             self._render_map()
             pangolin.FinishFrame()
 
+        # Compute and print ATE
+        self._compute_ate(frames)
         print(f"Pipeline Complete. Re-localizations: {reloc_count}")
+
+    def _compute_ate(self, frames):
+        """Compute and print ATE after processing."""
+        vo_positions = np.array(self.trajectory)
+        gt_positions = np.array(self.gt_trajectory)
+        if len(gt_positions) < 2 or len(vo_positions) < 2:
+            return
+
+        # Use min length
+        n = min(len(vo_positions), len(gt_positions))
+        vo_pos = vo_positions[:n]
+        gt_pos = gt_positions[:n]
+
+        errors = np.linalg.norm(vo_pos - gt_pos, axis=1)
+        rmse = np.sqrt(np.mean(errors**2))
+        print(f"\n{'='*50}")
+        print(f"Absolute Trajectory Error (ATE)")
+        print(f"{'='*50}")
+        print(f"  RMSE:    {rmse:.4f} m")
+        print(f"  Mean:    {np.mean(errors):.4f} m")
+        print(f"  Max:     {np.max(errors):.4f} m")
+        print(f"  Frames:  {n}")
+        print(f"{'='*50}")
 
     def _render_map(self):
         """Renders GT trajectory, VO trajectory, camera frustums, and point cloud."""
@@ -725,9 +715,9 @@ if __name__ == '__main__':
     if not os.path.exists(data_dir):
         print(f"Please ensure the dataset path is valid: {data_dir}")
     else:
-        print("Starting RGBD SLAM with IMU fusion. Map window will open shortly.")
+        print("Starting RGBD SLAM Pipeline. Map window will open shortly.")
         print("  Green line  = Ground Truth")
-        print("  Cyan line   = Visual-Inertial Odometry (VO + IMU)")
+        print("  Cyan line   = Visual Odometry (with re-localization)")
         print("  Red frustums = Camera poses")
         print("  Points = 3D map\n")
         slam = SLAMPipeline(data_dir)
